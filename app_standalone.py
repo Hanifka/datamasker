@@ -2,18 +2,20 @@
 """
 app.py — Streamlit UI for datamask (reversible sensitive-data masking).
 
-Run:  streamlit run app.py
-Needs datamask.py in the same directory.
+Run:  streamlit run app.py   (needs datamask.py in the same directory)
 
-Tabs:
-  1. Scan   — upload files, see detected sensitive data + recommendations
-  2. Mask   — tokenize files, download masked copies + mapping.json (codebook)
-  3. Decode — upload AI output (pptx/docx/xlsx/csv) + mapping.json, download restored
+Two tabs:
+  🎭 Encode — scan → review/select values → tokenize → download masked + mapping.json
+  🔓 Decode — restore originals in AI output (pptx/docx/xlsx/csv/text) via mapping.json
+
+Results persist across reruns (session_state), so download buttons don't vanish
+after the first click.
 """
 
 import io
 import json
 import os
+import re
 import tempfile
 import zipfile
 
@@ -57,6 +59,13 @@ DETECTORS = [
     ("fqdn",     "FQDNX", re.compile(
         r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.){2,}[A-Za-z]{2,}\b"),
         lambda s: not re.search(r"\.(?:exe|dll|csv|xlsx|docx|pptx|txt|log|json|xml|py|sh|js|zip|png|jpg)$", s, re.I)),
+    # log key=value hostnames: host=WEB01, hostname: jakarta-app02, computer="PC-BUDI"
+    ("hostname", "HOSTX", re.compile(
+        r"(?i)\b(?:src[._-]?host|dst[._-]?host|host(?:name)?|computer(?:name)?|"
+        r"device(?:name)?|machine|agent[._-]?name|asset|node)\s*[:=]\s*\"?"
+        r"([A-Za-z][A-Za-z0-9._-]{2,60})\"?"),
+        lambda s: s.lower() not in {"true","false","null","none","unknown","localhost",
+                                    "name","value","string","header","info"}),
     # DOMAIN\username — filter out Windows paths / registry keys / filenames
     ("username", "USERX", re.compile(r"\b[A-Za-z][A-Za-z0-9_-]{1,20}\\[A-Za-z][A-Za-z0-9._-]{2,30}\b"),
         lambda s: (lambda dom, usr: (
@@ -340,18 +349,85 @@ def extract_text(path):
         return f.read()
 
 
+# ------------------------------------------------- column-aware detection
+
+VALUE_STOPLIST = {"n/a","na","-","--","none","null","unknown","true","false","yes","no","total"}
+
+def header_category(header):
+    """Map a column header to a sensitive category, or None."""
+    if header is None:
+        return None
+    tokens = [t for t in re.split(r"[^a-z0-9]+", str(header).lower()) if t]
+    joined = "".join(tokens)
+    def has(pred):
+        return any(pred(t) for t in tokens) or pred(joined)
+    if has(lambda t: t in {"host","hostname","computer","computername","device",
+                           "devicename","machine","server","servername","agent",
+                           "agentname","asset","node","endpoint","workstation"}):
+        return "hostname"
+    if has(lambda t: t == "ip" or t in {"ipaddress","ipaddr"}
+                     or (t.endswith("ip") and t not in {"zip","tooltip","ownership"})):
+        return "ipv4"
+    if has(lambda t: t in {"user","username","account","login","logon","acct","userid",
+                           "accountname","targetuser","subjectuser"}):
+        return "username"
+    if has(lambda t: t in {"email","mail","emailaddress","sender","recipient"}):
+        return "email"
+    if has(lambda t: t in {"mac","macaddress","macaddr"}):
+        return "mac"
+    if has(lambda t: t in {"domain","fqdn","dns","dnsname"}):
+        return "fqdn"
+    return None
+
+def find_structured(path):
+    """Column-header-aware findings for spreadsheets: [(category, value, column)]."""
+    ext = os.path.splitext(path)[1].lower()
+    out = []
+    def scan_grid(rows_iter):
+        headers = None
+        raw_headers = None
+        for row in rows_iter:
+            if headers is None:
+                raw_headers = [str(c) if c is not None else "" for c in row]
+                headers = [header_category(c) for c in row]
+                continue
+            for i, v in enumerate(row):
+                if i >= len(headers) or not headers[i] or v in (None, ""):
+                    continue
+                s = str(v).strip()
+                if (len(s) < 3 or s.lower() in VALUE_STOPLIST
+                        or s.startswith("=") or (s.isdigit() and len(s) < 7)):
+                    continue
+                out.append((headers[i], s, raw_headers[i]))
+    if ext in (".xlsx", ".xlsm"):
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True)
+        for ws in wb.worksheets:
+            scan_grid(ws.iter_rows(values_only=True))
+    elif ext in (".csv", ".tsv"):
+        delim = "\t" if ext == ".tsv" else ","
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            scan_grid(csv_mod.reader(f, delimiter=delim))
+    return out
+
+
 # ==== end inline ====
 
 
 st.set_page_config(page_title="DataMask", page_icon="🛡️", layout="wide")
-st.title("🛡️ DataMask — Reversible Masking for SOC Reports")
-st.caption("Detect → Mask → kirim ke AI → Decode. Codebook (mapping.json) = kunci, jangan pernah ikut dikirim ke AI.")
+st.title("🛡️ DataMask")
+st.caption("Encode data sensitif → kasih ke AI → Decode hasilnya. "
+           "mapping.json = kunci — simpan aman, jangan pernah ikut ke AI.")
 
 SUPPORTED = tuple(HANDLERS.keys())
+CAT_PREFIX = {cat: pfx for cat, pfx, _, _ in DETECTORS}
+CAT_PREFIX["custom"] = "CUSTX"
+CATS = list(CAT_PREFIX.keys())
 
+
+# ---------------------------------------------------------------- helpers
 
 def _save_upload(uploaded):
-    """Persist an uploaded file to a temp path, return path."""
     suffix = os.path.splitext(uploaded.name)[1].lower()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(uploaded.getvalue())
@@ -359,51 +435,31 @@ def _save_upload(uploaded):
     return tmp.name
 
 
-def _process(uploaded_files, fn, suffix):
-    """Run mask/unmask fn over uploads; return list of (name, bytes, count)."""
-    results = []
-    for up in uploaded_files:
-        ext = os.path.splitext(up.name)[1].lower()
-        handler = HANDLERS.get(ext)
-        if not handler:
-            results.append((up.name, None, f"unsupported type {ext}"))
-            continue
-        in_path = _save_upload(up)
-        out_path = in_path + ".out" + ext
-        n = handler(in_path, out_path, fn)
-        with open(out_path, "rb") as f:
-            data = f.read()
-        os.unlink(in_path); os.unlink(out_path)
-        stem, e = os.path.splitext(up.name)
-        results.append((f"{stem}{suffix}{e}", data, n))
-    return results
-
-
-def _zip_results(results, extra=None):
+def _zip_results(files, extra=None):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for name, data, _ in results:
+        for name, data, _ in files:
             if data is not None:
                 z.writestr(name, data)
         if extra:
             for name, data in extra.items():
                 z.writestr(name, data)
     buf.seek(0)
-    return buf
+    return buf.getvalue()
 
 
 def codebook_from_json_str(s):
-    """Build a Codebook from a pasted mapping.json string. Returns (cb, error)."""
+    """Codebook from pasted mapping.json. Accepts full file, entries-only, or simple dict."""
     cb = Codebook()
     try:
         data = json.loads(s)
     except json.JSONDecodeError as e:
         return None, f"JSON tidak valid: {e}"
-    entries = data.get("entries", data)  # accept full file or just the entries dict
+    entries = data.get("entries", data)
     for orig, entry in entries.items():
         if isinstance(entry, dict) and "token" in entry:
             token, cat = entry["token"], entry.get("category", "?")
-        elif isinstance(entry, str):     # also accept simple {"original": "TOKEN"}
+        elif isinstance(entry, str):
             token, cat = entry, "?"
         else:
             continue
@@ -416,21 +472,19 @@ def codebook_from_json_str(s):
     return cb, None
 
 
-def mapping_input(label_prefix, key_prefix):
-    """Upload-or-paste widget for mapping.json. Returns Codebook or None."""
-    m = st.radio(f"{label_prefix} — sumber", ["📁 Upload", "📋 Paste JSON"],
-                 horizontal=True, key=f"{key_prefix}_src")
+def mapping_input(label, key):
+    """Upload-or-paste widget for mapping.json → Codebook or None."""
+    m = st.radio(f"{label} — sumber", ["📁 Upload", "📋 Paste JSON"],
+                 horizontal=True, key=f"{key}_src")
     if m == "📁 Upload":
-        up = st.file_uploader(f"{label_prefix} (mapping.json)", type=["json"],
-                              key=f"{key_prefix}_up")
+        up = st.file_uploader(f"{label} (mapping.json)", type=["json"], key=f"{key}_up")
         if up:
             p = _save_upload(up)
             cb = Codebook(p)
             os.unlink(p)
             return cb
         return None
-    pasted = st.text_area(f"{label_prefix} — paste isi mapping.json",
-                          height=150, key=f"{key_prefix}_txt")
+    pasted = st.text_area(f"{label} — paste isi mapping.json", height=140, key=f"{key}_txt")
     if pasted.strip():
         cb, err = codebook_from_json_str(pasted)
         if err:
@@ -442,7 +496,6 @@ def mapping_input(label_prefix, key_prefix):
 
 
 def decode_table(text, cb):
-    """Rows of (token, original, category, occurrences) for tokens present in text."""
     rows = []
     for token, orig in cb.rev.items():
         n = text.count(token)
@@ -452,135 +505,89 @@ def decode_table(text, cb):
     return sorted(rows, key=lambda r: r["Token"])
 
 
-tab_scan, tab_mask, tab_decode = st.tabs(["🔍 1. Scan", "🎭 2. Mask (Encode)", "🔓 3. Decode (Unmask)"])
+def codebook_bytes(cb):
+    entries = {o: {"token": t, "category": cb.categories.get(o, "?"),
+                   "recommendation": MASK_RECOMMENDATION.get(cb.categories.get(o, ""), "")}
+               for o, t in cb.map.items()}
+    return json.dumps({"meta": cb.meta, "entries": entries}, indent=2).encode()
 
-# ------------------------------------------------------------------ SCAN
-with tab_scan:
-    st.subheader("Deteksi data sensitif")
-    st.info("ℹ️ Tab ini **view-only** (cek cepat isi file). Untuk pilih value di tabel, "
-            "encode, dan dapat **mapping.json** → pakai tab **🎭 2. Mask** "
-            "(di sana juga ada tombol Scan, jadi bisa langsung mulai dari sana).")
-    mode = st.radio("Input", ["📁 Upload file", "📋 Paste text"], horizontal=True, key="scan_mode")
 
-    if mode == "📋 Paste text":
-        pasted = st.text_area("Paste teks di sini (log, email, chat, apapun)",
-                              height=220, key="scan_txt")
-        if pasted and st.button("Scan text", type="primary", key="scan_txt_btn"):
-            agg = {}
-            for cat, pfx, val in find_all(pasted):
-                agg.setdefault(cat, set()).add(val)
-            if not agg:
-                st.success("Tidak ada data sensitif terdeteksi.")
-            for cat in sorted(agg):
-                st.markdown(f"**{cat.upper()}** ({len(agg[cat])} unique)")
-                st.code(", ".join(sorted(agg[cat])), language=None)
-            if agg:
-                st.table([{"Category": c.upper(), "Unique": len(v),
-                           "Recommendation": MASK_RECOMMENDATION.get(c, "")}
-                          for c, v in sorted(agg.items())])
+tab_enc, tab_dec = st.tabs(["🎭 Encode", "🔓 Decode"])
 
-    ups = None
-    if mode == "📁 Upload file":
-        ups = st.file_uploader("Upload report files", type=[e.lstrip(".") for e in SUPPORTED],
-                               accept_multiple_files=True, key="scan_up")
-    if ups and st.button("Scan", type="primary"):
-        grand = {}
-        for up in ups:
-            path = _save_upload(up)
-            text = extract_text(path)
-            os.unlink(path)
-            agg = {}
-            for cat, pfx, val in find_all(text):
-                agg.setdefault(cat, set()).add(val)
-            with st.expander(f"📄 {up.name} — {sum(len(v) for v in agg.values())} unique findings",
-                             expanded=True):
-                if not agg:
-                    st.success("Tidak ada data sensitif terdeteksi.")
-                for cat in sorted(agg):
-                    grand.setdefault(cat, set()).update(agg[cat])
-                    st.markdown(f"**{cat.upper()}** ({len(agg[cat])} unique)")
-                    st.code(", ".join(sorted(agg[cat])), language=None)
-        if grand:
-            st.divider()
-            st.subheader("Rekomendasi masking")
-            st.table([{"Category": c.upper(), "Unique": len(v),
-                       "Recommendation": MASK_RECOMMENDATION.get(c, "")}
-                      for c, v in sorted(grand.items())])
-
-# ------------------------------------------------------------------ MASK
-with tab_mask:
-    st.subheader("Tokenize / encode data sensitif")
-    st.caption("Alur: 1) Scan → 2) review & pilih value yang mau di-encode (bisa hapus/tambah) → 3) Encode.")
-    mode = st.radio("Input", ["📁 Upload file", "📋 Paste text"], horizontal=True, key="mask_mode")
+# ================================================================= ENCODE
+with tab_enc:
+    st.subheader("1 · Input")
+    mode = st.radio("Input", ["📁 Upload file", "📋 Paste text"], horizontal=True,
+                    key="mask_mode", label_visibility="collapsed")
     with st.expander("(Opsional) mapping.json lama — biar token konsisten antar batch"):
         prev_cb = mapping_input("Mapping lama", "mask_map")
 
-    CAT_PREFIX = {cat: pfx for cat, pfx, _, _ in DETECTORS}
-    CAT_PREFIX["custom"] = "CUSTX"
-    CATS = list(CAT_PREFIX.keys())
-
     pasted, ups = None, None
     if mode == "📋 Paste text":
-        pasted = st.text_area("Paste teks yang mau di-mask", height=200, key="mask_txt")
+        pasted = st.text_area("Paste teks yang mau di-encode", height=180, key="mask_txt")
     else:
-        ups = st.file_uploader("Upload files to mask", type=[e.lstrip(".") for e in SUPPORTED],
+        ups = st.file_uploader("Upload files", type=[e.lstrip(".") for e in SUPPORTED],
                                accept_multiple_files=True, key="mask_up")
 
-    # ---- Step 1: scan
-    if st.button("🔍 Scan dulu", type="primary", disabled=not (pasted or ups)):
-        sources = []  # (source_name, text)
+    if st.button("🔍 Scan", type="primary", disabled=not (pasted or ups)):
+        sources, structured = [], []
         if pasted:
             sources.append(("(pasted text)", pasted))
         if ups:
             for up in ups:
                 p = _save_upload(up)
                 sources.append((up.name, extract_text(p)))
+                if os.path.splitext(up.name)[1].lower() in (".xlsx", ".xlsm", ".csv", ".tsv"):
+                    structured.extend((cat, val, col, up.name)
+                                      for cat, val, col in find_structured(p))
                 os.unlink(p)
         combined = "\n".join(t for _, t in sources)
         st.session_state["mask_scan_text"] = combined
         seen, where = {}, {}
+        # column-aware findings first (header context beats regex guess)
+        for cat, val, col, fname in structured:
+            seen.setdefault(val, cat)
+            where.setdefault(val, set()).add(f"{fname} [kolom: {col}]")
         for name, t in sources:
             for cat, pfx, val in find_all(t):
                 seen.setdefault(val, cat)
                 where.setdefault(val, set()).add(name)
         st.session_state["mask_rows"] = [
             {"Encode": True, "Value": v, "Category": c,
-             "Matches": combined.count(v),
-             "Files": ", ".join(sorted(where.get(v, [])))}
+             "Matches": combined.count(v), "Files": ", ".join(sorted(where.get(v, [])))}
             for v, c in sorted(seen.items())
         ]
+        st.session_state.pop("enc_results", None)  # new scan invalidates old results
 
-    # ---- Step 2: review & select
+    # ---------------- review & select
     if st.session_state.get("mask_rows"):
-        rows = st.session_state["mask_rows"]  # master list (all values)
+        st.subheader("2 · Review & pilih")
+        rows = st.session_state["mask_rows"]
 
         all_cats = sorted({r["Category"] for r in rows})
         cat_counts = {c: sum(1 for r in rows if r["Category"] == c) for c in all_cats}
-        inc_cats = st.multiselect(
-            "Kategori yang di-include (hapus kategori = bulk exclude semua value-nya):",
-            options=all_cats, default=all_cats,
+        c1, c2 = st.columns([2, 1])
+        inc_cats = c1.multiselect(
+            "Kategori", options=all_cats, default=all_cats,
             format_func=lambda c: f"{c} ({cat_counts[c]})", key="mask_cats")
+        q = c2.text_input("🔎 Filter value (substring)", key="mask_filter")
 
-        # text filter (substring, case-insensitive)
-        q = st.text_input("🔎 Filter value (substring, mis. 'DC-' atau '10.10.'):",
-                          key="mask_filter")
         def visible(r):
             return r["Category"] in inc_cats and (not q or q.lower() in r["Value"].lower())
         vis_idx = [k for k, r in enumerate(rows) if visible(r)]
 
-        # bulk actions on the filtered subset
         b1, b2, b3 = st.columns(3)
-        if b1.button(f"✅ Check semua hasil filter ({len(vis_idx)})"):
-            for k in vis_idx: rows[k]["Encode"] = True
-        if b2.button(f"⬜ Uncheck semua hasil filter ({len(vis_idx)})"):
-            for k in vis_idx: rows[k]["Encode"] = False
-        if b3.button(f"🗑 Hapus semua hasil filter ({len(vis_idx)})"):
-            st.session_state["mask_rows"] = [r for k, r in enumerate(rows) if k not in set(vis_idx)]
+        if b1.button(f"✅ Check hasil filter ({len(vis_idx)})"):
+            for k in vis_idx:
+                rows[k]["Encode"] = True
+        if b2.button(f"⬜ Uncheck hasil filter ({len(vis_idx)})"):
+            for k in vis_idx:
+                rows[k]["Encode"] = False
+        if b3.button(f"🗑 Hapus hasil filter ({len(vis_idx)})"):
+            st.session_state["mask_rows"] = [r for k, r in enumerate(rows)
+                                             if k not in set(vis_idx)]
             st.rerun()
 
-        st.markdown("**Review findings** — uncheck yang nggak mau di-encode, "
-                    "hapus baris (ikon 🗑), atau tambah baris baru untuk value custom "
-                    "(nama klien, ticket ID, dll):")
         vis_rows = [rows[k] for k in vis_idx]
         edited = st.data_editor(
             vis_rows,
@@ -589,29 +596,28 @@ with tab_mask:
                 "Value": st.column_config.TextColumn("Value", required=True),
                 "Category": st.column_config.SelectboxColumn("Category", options=CATS,
                                                              default="custom"),
-                "Matches": st.column_config.NumberColumn("Matches (saat scan)", disabled=True),
+                "Matches": st.column_config.NumberColumn("Matches", disabled=True),
                 "Files": st.column_config.TextColumn("Ada di file", disabled=True),
             },
             num_rows="dynamic", use_container_width=True,
             key=f"mask_editor_{len(vis_idx)}_{q}_{','.join(inc_cats)}",
         )
 
-        # merge edits back into master (by position for existing, append new rows)
+        # merge edits back into master
         for n, k in enumerate(vis_idx):
             if n < len(edited) and edited[n].get("Value"):
                 rows[k].update({"Encode": bool(edited[n].get("Encode")),
                                 "Value": edited[n]["Value"],
                                 "Category": edited[n].get("Category") or "custom"})
-        existing_vals = {r["Value"] for r in rows}
-        for extra in edited[len(vis_idx):]:  # manually added rows
-            if extra.get("Value") and extra["Value"] not in existing_vals:
+        existing = {r["Value"] for r in rows}
+        for extra in edited[len(vis_idx):]:
+            if extra.get("Value") and extra["Value"] not in existing:
                 rows.append({"Encode": bool(extra.get("Encode", True)),
                              "Value": extra["Value"],
                              "Category": extra.get("Category") or "custom",
                              "Matches": st.session_state.get("mask_scan_text", "").count(extra["Value"]),
                              "Files": "(manual)"})
 
-        # selection = ALL checked rows in master (not just visible), respecting category exclude
         selected = {r["Value"]: r.get("Category") or "custom"
                     for r in rows if r.get("Encode") and r.get("Value")
                     and r["Category"] in inc_cats}
@@ -619,145 +625,170 @@ with tab_mask:
         st.write(f"Terpilih untuk encode: **{len(selected)}** dari {len(rows)} value"
                  + (f" · 🚫 {excl} di-exclude via kategori" if excl else ""))
 
-        # live match check — recount against scanned text on every edit
-        scan_text = st.session_state.get("mask_scan_text", "")
-        if selected and scan_text:
-            check = []
-            zero = []
-            for v, c in selected.items():
-                hits = scan_text.count(v)
-                check.append({"Value": v, "Category": c, "Matches": hits,
-                              "Chars": len(v), "Chars total": hits * len(v)})
-                if hits == 0:
-                    zero.append(v)
-            st.markdown("**Match check (live):**")
-            st.dataframe(check, use_container_width=True)
-            if zero:
-                st.warning("⚠️ 0 match — cek typo / case-sensitive: " + ", ".join(zero))
+        with st.expander("🔍 Cek konteks — value ini muncul di mana?"):
+            ctx_q = st.text_input("Value yang mau dicek:", key="ctx_q")
+            scan_text = st.session_state.get("mask_scan_text", "")
+            if ctx_q and scan_text:
+                hits = [m.start() for m in re.finditer(re.escape(ctx_q), scan_text)]
+                if not hits:
+                    st.warning("0 match di teks hasil scan.")
+                else:
+                    st.write(f"{len(hits)} match — menampilkan max 15:")
+                    for h in hits[:15]:
+                        snip = scan_text[max(0, h - 70):h + len(ctx_q) + 70].replace("\n", " ⏎ ")
+                        st.code(f"…{snip}…", language=None)
 
-        # ---- Step 3: encode only the selected values
+        # ---------------- encode
+        st.subheader("3 · Encode")
         if selected and st.button("🎭 Encode selected", type="primary"):
             cb = prev_cb if prev_cb else Codebook()
+            pattern = re.compile("|".join(
+                re.escape(v) for v in sorted(selected, key=len, reverse=True)))
 
             def fn(text):
-                n = 0
-                for orig in sorted(selected, key=len, reverse=True):
-                    if orig in text:
-                        cat = selected[orig]
-                        token = cb.token_for(orig, cat, CAT_PREFIX.get(cat, "CUSTX"))
-                        n += text.count(orig)
-                        text = text.replace(orig, token)
-                return text, n
+                cnt = [0]
+                def rep(m):
+                    cnt[0] += 1
+                    orig = m.group(0)
+                    cat = selected[orig]
+                    return cb.token_for(orig, cat, CAT_PREFIX.get(cat, "CUSTX"))
+                return pattern.sub(rep, text), cnt[0]
 
-            entries_bytes = None
-            if pasted:
-                masked, n = fn(pasted)
-                st.write(f"✅ {n} replacements")
-                st.text_area("Hasil masked — copy dari sini, kasih ke AI", masked,
-                             height=200, key="mask_txt_out")
-            results = []
-            if ups:
-                results = _process(ups, fn, "_masked")
-                for name, data, n in results:
-                    if data is None:
-                        st.warning(f"{name}: {n}")
-                    else:
-                        st.write(f"✅ **{name}** — {n} replacements")
+            files, masked_text, log = [], None, []
+            with st.status("🎭 Encoding…", expanded=True) as status:
+                st.write(f"▶️ {len(selected)} value terpilih.")
+                if pasted:
+                    masked_text, n = fn(pasted)
+                    log.append(f"pasted text — {n} replacements")
+                    st.write(f"✅ {log[-1]}")
+                if ups:
+                    prog = st.progress(0.0)
+                    for i, up in enumerate(ups, 1):
+                        ext = os.path.splitext(up.name)[1].lower()
+                        handler = HANDLERS.get(ext)
+                        if not handler:
+                            st.write(f"⏭ {up.name}: tipe {ext} tidak didukung")
+                            continue
+                        st.write(f"⏳ ({i}/{len(ups)}) {up.name}…")
+                        in_path = _save_upload(up)
+                        out_path = in_path + ".out" + ext
+                        n = handler(in_path, out_path, fn)
+                        with open(out_path, "rb") as f:
+                            data = f.read()
+                        os.unlink(in_path); os.unlink(out_path)
+                        stem, e = os.path.splitext(up.name)
+                        files.append((f"{stem}_masked{e}", data, n))
+                        log.append(f"{up.name} — {n} replacements")
+                        st.write(f"✅ ({i}/{len(ups)}) {log[-1]}")
+                        prog.progress(i / len(ups))
+                status.update(label=f"✅ Encode selesai — {len(cb.map)} unique di codebook",
+                              state="complete")
 
-            entries = {o: {"token": t, "category": cb.categories.get(o, "?"),
-                           "recommendation": MASK_RECOMMENDATION.get(cb.categories.get(o, ""), "")}
-                       for o, t in cb.map.items()}
-            map_bytes = json.dumps({"meta": cb.meta, "entries": entries}, indent=2).encode()
+            st.session_state["enc_results"] = {
+                "files": files, "masked_text": masked_text, "log": log,
+                "map_bytes": codebook_bytes(cb),
+                "cb_rows": [{"Original": o, "Token": t,
+                             "Category": cb.categories.get(o, "?")}
+                            for o, t in cb.map.items()],
+            }
 
-            st.divider()
-            st.subheader(f"Codebook — {len(cb.map)} unique values")
-            st.dataframe([{"Original": o, "Token": t, "Category": cb.categories.get(o, "?")}
-                          for o, t in cb.map.items()], use_container_width=True)
-            st.error("⚠️ Simpan mapping.json SEKARANG (download atau copy) — itu kunci decode, jangan ikut ke AI.")
-            with st.expander("📋 Copy mapping.json sebagai teks"):
-                st.code(map_bytes.decode(), language="json")
-            c1, c2 = st.columns(2)
-            c2.download_button("⬇️ mapping.json saja", map_bytes,
-                               "mapping.json", "application/json")
-            if results:
-                zbuf = _zip_results(results, extra={"mapping.json": map_bytes})
-                c1.download_button("⬇️ Masked files + mapping.json (zip)", zbuf,
-                                   "masked_bundle.zip", "application/zip", type="primary")
-            else:
-                c1.download_button("⬇️ mapping.json (primary)", map_bytes,
-                                   "mapping_.json", "application/json", type="primary")
+    # ---------------- results (persist across reruns / downloads)
+    res = st.session_state.get("enc_results")
+    if res:
+        st.divider()
+        st.subheader("📦 Hasil encode")
+        for line in res["log"]:
+            st.write(f"✅ {line}")
+        if res["masked_text"] is not None:
+            st.text_area("Hasil masked — copy dari sini, kasih ke AI",
+                         res["masked_text"], height=180, key="mask_txt_out")
+        st.dataframe(res["cb_rows"], use_container_width=True)
+        st.error("⚠️ Simpan mapping.json (download atau copy) — itu kunci decode, "
+                 "jangan ikut ke AI.")
+        with st.expander("📋 Copy mapping.json sebagai teks"):
+            st.code(res["map_bytes"].decode(), language="json")
+        d1, d2 = st.columns(2)
+        if res["files"]:
+            d1.download_button("⬇️ Masked files + mapping.json (zip)",
+                               _zip_results(res["files"],
+                                            extra={"mapping.json": res["map_bytes"]}),
+                               "masked_bundle.zip", "application/zip",
+                               type="primary", key="dl_zip")
+        d2.download_button("⬇️ mapping.json", res["map_bytes"],
+                           "mapping.json", "application/json", key="dl_map")
+        for name, data, n in res["files"]:
+            st.download_button(f"⬇️ {name}", data, name, key=f"dl_{name}")
 
-# ------------------------------------------------------------------ DECODE
-with tab_decode:
-    st.subheader("Decode file hasil AI (atau file masked apa pun)")
-    st.markdown(
-        "Alur: file masked lo kasih ke AI → AI bikin PPT/report berisi token "
-        "(`HOSTX001`, `IPX002`, ...) → upload hasilnya di sini **plus mapping.json** "
-        "→ semua token dikembalikan ke nilai asli."
-    )
-    mode = st.radio("Input", ["📁 Upload file", "📋 Paste text"], horizontal=True, key="dec_mode")
+# ================================================================= DECODE
+with tab_dec:
+    st.subheader("1 · Codebook")
     dec_cb = mapping_input("Codebook", "dec_map")
 
+    st.subheader("2 · Input")
+    mode = st.radio("Input", ["📁 Upload file", "📋 Paste text"], horizontal=True,
+                    key="dec_mode", label_visibility="collapsed")
+    d_pasted, d_ups = None, None
     if mode == "📋 Paste text":
-        pasted = st.text_area("Paste output AI yang berisi token (HOSTX001, IPX002, ...)",
-                              height=220, key="dec_txt")
-        if pasted and dec_cb and st.button("Decode text", type="primary", key="dec_txt_btn"):
-            cb = dec_cb
-            if True:
-                table = decode_table(pasted, cb)
-                restored, n = unmask_text(pasted, cb)
-                st.write(f"🔓 {n} token direstorasi ({len(table)} unique)")
-                if table:
-                    st.subheader("Decode summary")
-                    st.dataframe(table, use_container_width=True)
-                st.text_area("Hasil decoded", restored, height=220, key="dec_txt_out")
-                if n == 0:
-                    st.info("Tidak ada token ditemukan — cek mapping.json-nya.")
+        d_pasted = st.text_area("Paste output AI yang berisi token", height=180,
+                                key="dec_txt")
+    else:
+        d_ups = st.file_uploader("Upload files (pptx/docx/xlsx/csv/...)",
+                                 type=[e.lstrip(".") for e in SUPPORTED],
+                                 accept_multiple_files=True, key="dec_up")
 
-    ups = None
-    if mode == "📁 Upload file":
-        ups = st.file_uploader("Upload files to decode (pptx/docx/xlsx/csv/...)",
-                               type=[e.lstrip(".") for e in SUPPORTED],
-                               accept_multiple_files=True, key="dec_up")
-    if ups and dec_cb and st.button("Decode", type="primary"):
+    if st.button("🔓 Decode", type="primary",
+                 disabled=not (dec_cb and (d_pasted or d_ups))):
         cb = dec_cb
-        if True:
-            results, total = [], 0
-            all_rows = {}
-            for up in ups:
-                ext = os.path.splitext(up.name)[1].lower()
-                handler = HANDLERS.get(ext)
-                if not handler:
-                    st.warning(f"{up.name}: unsupported type {ext}")
-                    continue
-                in_path = _save_upload(up)
-                rows = decode_table(extract_text(in_path), cb)
-                out_path = in_path + ".out" + ext
-                n = handler(in_path, out_path, lambda t: unmask_text(t, cb))
-                with open(out_path, "rb") as f:
-                    data = f.read()
-                os.unlink(in_path); os.unlink(out_path)
-                stem, e = os.path.splitext(up.name)
-                name = f"{stem}_restored{e}"
-                results.append((name, data, n))
+        files, tables, text_out, total = [], {}, None, 0
+        with st.status("🔓 Decoding…", expanded=True) as status:
+            if d_pasted:
+                tables["(pasted text)"] = decode_table(d_pasted, cb)
+                text_out, n = unmask_text(d_pasted, cb)
                 total += n
-                st.write(f"🔓 **{name}** — {n} token direstorasi")
-                if rows:
-                    st.dataframe(rows, use_container_width=True)
-                    for r in rows:
-                        key = r["Token"]
-                        if key in all_rows:
-                            all_rows[key]["Count"] += r["Count"]
-                        else:
-                            all_rows[key] = dict(r)
-                st.download_button(f"⬇️ {name}", data, name, key=f"dl_{name}")
-            if len(results) > 1:
-                st.divider()
-                st.subheader("Decode summary — semua file")
-                st.dataframe(sorted(all_rows.values(), key=lambda r: r["Token"]),
-                             use_container_width=True)
-                st.download_button("⬇️ Download semua (zip)", _zip_results(results),
-                                   "restored_bundle.zip", "application/zip", type="primary")
-            if total == 0:
-                st.info("Tidak ada token ditemukan — cek apakah mapping.json-nya benar "
-                        "untuk batch ini, atau AI mengubah format token.")
+                st.write(f"✅ pasted text — {n} token direstorasi")
+            if d_ups:
+                prog = st.progress(0.0)
+                for i, up in enumerate(d_ups, 1):
+                    ext = os.path.splitext(up.name)[1].lower()
+                    handler = HANDLERS.get(ext)
+                    if not handler:
+                        st.write(f"⏭ {up.name}: tipe {ext} tidak didukung")
+                        continue
+                    st.write(f"⏳ ({i}/{len(d_ups)}) {up.name}…")
+                    in_path = _save_upload(up)
+                    tables[up.name] = decode_table(extract_text(in_path), cb)
+                    out_path = in_path + ".out" + ext
+                    n = handler(in_path, out_path, lambda t: unmask_text(t, cb))
+                    with open(out_path, "rb") as f:
+                        data = f.read()
+                    os.unlink(in_path); os.unlink(out_path)
+                    stem, e = os.path.splitext(up.name)
+                    files.append((f"{stem}_restored{e}", data, n))
+                    total += n
+                    st.write(f"✅ ({i}/{len(d_ups)}) {up.name} — {n} token direstorasi")
+                    prog.progress(i / len(d_ups))
+            status.update(label=f"✅ Decode selesai — {total} token direstorasi",
+                          state="complete")
+        st.session_state["dec_results"] = {"files": files, "tables": tables,
+                                           "text": text_out, "total": total}
+
+    res = st.session_state.get("dec_results")
+    if res:
+        st.divider()
+        st.subheader("📦 Hasil decode")
+        if res["total"] == 0:
+            st.info("Tidak ada token ditemukan — cek apakah mapping.json-nya benar "
+                    "untuk batch ini, atau AI mengubah format token.")
+        for src_name, table in res["tables"].items():
+            if table:
+                st.markdown(f"**Decode summary — {src_name}**")
+                st.dataframe(table, use_container_width=True)
+        if res["text"] is not None:
+            st.text_area("Hasil decoded", res["text"], height=180, key="dec_txt_out")
+        for name, data, n in res["files"]:
+            st.download_button(f"⬇️ {name} ({n} restorasi)", data, name,
+                               key=f"dl_dec_{name}")
+        if len(res["files"]) > 1:
+            st.download_button("⬇️ Download semua (zip)", _zip_results(res["files"]),
+                               "restored_bundle.zip", "application/zip",
+                               type="primary", key="dl_dec_zip")
