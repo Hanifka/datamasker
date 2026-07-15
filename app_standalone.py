@@ -367,12 +367,18 @@ def extract_text(path):
 
 VALUE_STOPLIST = {"n/a","na","-","--","none","null","unknown","true","false","yes","no","total"}
 
+AGGREGATE_TOKENS = {"count","counts","total","totals","sum","avg","average","mean",
+                    "unique","distinct","pct","percent","percentage","qty","quantity",
+                    "min","max","rate","ratio","freq","frequency"}
+
 def header_category(header):
     """Map a column header to a sensitive category, or None."""
     if header is None:
         return None
     tokens = [t for t in re.split(r"[^a-z0-9]+", str(header).lower()) if t]
     joined = "".join(tokens)
+    if any(t in AGGREGATE_TOKENS for t in tokens):
+        return None  # "Source IP (Unique Count)" = kolom agregat, bukan data
     def has(pred):
         return any(pred(t) for t in tokens) or pred(joined)
     if has(lambda t: t in {"host","hostname","computer","computername","device",
@@ -412,7 +418,15 @@ def find_structured(path):
                 if (len(s) < 3 or s.lower() in VALUE_STOPLIST
                         or s.startswith("=") or (s.isdigit() and len(s) < 7)):
                     continue
-                out.append((headers[i], s, raw_headers[i]))
+                cat = headers[i]
+                # value must look plausible for its category
+                if cat == "ipv4" and not re.fullmatch(r"[\d.,:/\s*x-]+", s):
+                    continue  # "Multiple (1,021)" etc.
+                if cat == "mac" and not re.fullmatch(r"[0-9A-Fa-f:.-]+", s):
+                    continue
+                if cat == "email" and "@" not in s:
+                    continue
+                out.append((cat, s, raw_headers[i]))
     if ext in (".xlsx", ".xlsm"):
         import openpyxl
         wb = openpyxl.load_workbook(path, read_only=True)
@@ -566,11 +580,18 @@ with tab_enc:
             for cat, pfx, val in find_all(t):
                 seen.setdefault(val, cat)
                 where.setdefault(val, set()).add(name)
+        def fmt_files(names):
+            # if "file.xlsx [kolom: X]" exists, drop the bare "file.xlsx" duplicate
+            names = set(names)
+            bare_dupes = {n for n in names
+                          if any(o != n and o.startswith(n + " [") for o in names)}
+            return ", ".join(sorted(names - bare_dupes))
         st.session_state["mask_rows"] = [
             {"Encode": True, "Value": v, "Category": c,
-             "Matches": combined.count(v), "Files": ", ".join(sorted(where.get(v, [])))}
+             "Matches": combined.count(v), "Files": fmt_files(where.get(v, []))}
             for v, c in sorted(seen.items())
         ]
+        st.session_state["mask_ver"] = st.session_state.get("mask_ver", 0) + 1
         st.session_state.pop("enc_results", None)  # new scan invalidates old results
 
     # ---------------- review & select
@@ -594,15 +615,21 @@ with tab_enc:
         if b1.button(f"✅ Check hasil filter ({len(vis_idx)})"):
             for k in vis_idx:
                 rows[k]["Encode"] = True
+            st.session_state["mask_ver"] += 1
+            st.rerun()
         if b2.button(f"⬜ Uncheck hasil filter ({len(vis_idx)})"):
             for k in vis_idx:
                 rows[k]["Encode"] = False
+            st.session_state["mask_ver"] += 1
+            st.rerun()
         if b3.button(f"🗑 Hapus hasil filter ({len(vis_idx)})"):
             st.session_state["mask_rows"] = [r for k, r in enumerate(rows)
                                              if k not in set(vis_idx)]
+            st.session_state["mask_ver"] += 1
             st.rerun()
 
-        vis_rows = [rows[k] for k in vis_idx]
+        vis_rows = [dict(rows[k]) for k in vis_idx]  # copies, editor owns them
+        ver = st.session_state.get("mask_ver", 0)
         edited = st.data_editor(
             vis_rows,
             column_config={
@@ -614,23 +641,40 @@ with tab_enc:
                 "Files": st.column_config.TextColumn("Ada di file", disabled=True),
             },
             num_rows="dynamic", use_container_width=True,
-            key=f"mask_editor_{len(vis_idx)}_{q}_{','.join(inc_cats)}",
+            key=f"mask_editor_v{ver}_{q}_{','.join(sorted(inc_cats))}",
         )
 
-        # merge edits back into master
-        for n, k in enumerate(vis_idx):
-            if n < len(edited) and edited[n].get("Value"):
-                rows[k].update({"Encode": bool(edited[n].get("Encode")),
-                                "Value": edited[n]["Value"],
-                                "Category": edited[n].get("Category") or "custom"})
-        existing = {r["Value"] for r in rows}
-        for extra in edited[len(vis_idx):]:
-            if extra.get("Value") and extra["Value"] not in existing:
-                rows.append({"Encode": bool(extra.get("Encode", True)),
-                             "Value": extra["Value"],
-                             "Category": extra.get("Category") or "custom",
-                             "Matches": st.session_state.get("mask_scan_text", "").count(extra["Value"]),
+        # ---- merge back by VALUE (robust against row deletion/reordering)
+        by_val = {r["Value"]: r for r in rows}
+        edited_vals = set()
+        structural_change = False
+        for erow in edited:
+            v = erow.get("Value")
+            if not v:
+                continue
+            edited_vals.add(v)
+            if v in by_val:
+                m = by_val[v]
+                if (m["Encode"] != bool(erow.get("Encode"))
+                        or m["Category"] != (erow.get("Category") or "custom")):
+                    m["Encode"] = bool(erow.get("Encode"))
+                    m["Category"] = erow.get("Category") or "custom"
+            else:  # brand-new / renamed row
+                rows.append({"Encode": bool(erow.get("Encode", True)), "Value": v,
+                             "Category": erow.get("Category") or "custom",
+                             "Matches": st.session_state.get("mask_scan_text", "").count(v),
                              "Files": "(manual)"})
+                structural_change = True
+        # rows visible before but now missing from editor -> user deleted them
+        deleted = [k for k in vis_idx if rows[k]["Value"] not in edited_vals]
+        if deleted:
+            st.session_state["mask_rows"] = [r for k, r in enumerate(rows)
+                                             if k not in set(deleted)]
+            structural_change = True
+        if structural_change:
+            st.session_state["mask_ver"] += 1
+            st.rerun()
+        rows = st.session_state["mask_rows"]
 
         selected = {r["Value"]: r.get("Category") or "custom"
                     for r in rows if r.get("Encode") and r.get("Value")
