@@ -282,8 +282,22 @@ def process_xlsx(path, out_path, fn):
     for ws in wb.worksheets:
         for row in ws.iter_rows():
             for cell in row:
-                if isinstance(cell.value, str) and not cell.value.startswith("="):
-                    new, n = fn(cell.value)
+                v = cell.value
+                if isinstance(v, str) and not v.startswith("="):
+                    new, n = fn(v)
+                    if n:
+                        cell.value = new
+                        count += n
+                elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                    # numeric cells (e.g. broken IP 172.1 stored as float)
+                    s = str(v)
+                    if s.endswith(".0"):
+                        s2, n = fn(s[:-2])
+                        if n:
+                            cell.value = s2
+                            count += n
+                            continue
+                    new, n = fn(s)
                     if n:
                         cell.value = new
                         count += n
@@ -642,8 +656,21 @@ with tab_enc:
         st.subheader("3 · Encode")
         if selected and st.button("🎭 Encode selected", type="primary"):
             cb = prev_cb if prev_cb else Codebook()
+
+            def _alt(v):
+                """Escape value + word boundaries so short fragments can't
+                corrupt longer values (172.1 must not hit 172.114.11.2)."""
+                pre = r"(?<![\w.])" if v[0].isalnum() else ""
+                if v[-1].isalnum():
+                    suf = r"(?![\w.])" if v[-1].isdigit() else r"(?!\w)"
+                elif v[-1] == ".":
+                    suf = r"(?!\d)"
+                else:
+                    suf = ""
+                return pre + re.escape(v) + suf
+
             pattern = re.compile("|".join(
-                re.escape(v) for v in sorted(selected, key=len, reverse=True)))
+                _alt(v) for v in sorted(selected, key=len, reverse=True)))
 
             def fn(text):
                 cnt = [0]
